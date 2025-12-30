@@ -1,0 +1,27 @@
+# InvokeAI + ROCm Setup - Git Ignore
+
+# Cache directories
+.cache/
+
+# InvokeAI data (models, outputs, database)
+invokeai-data/
+
+# Miniconda environment
+miniconda/
+
+# Log files
+*.log
+
+# Local scripts (contain local paths)
+register_model.py
+check_db.py
+import-model.ps1
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Windows
+Thumbs.db
+Desktop.ini
