@@ -29,6 +29,35 @@ function Get-InvokeAIGpuProfile {
     }
 }
 
+function Resolve-InvokeAIGpuProfileId {
+    param(
+        [Parameter(Mandatory)]
+        [string[]] $AdapterNames
+    )
+
+    $supportedProfiles = @(
+        Get-InvokeAIGpuProfile -Id 'gfx1201'
+        Get-InvokeAIGpuProfile -Id 'gfx1032'
+    )
+    $matches = @(
+        foreach ($profile in $supportedProfiles) {
+            foreach ($adapterName in $AdapterNames) {
+                if ($adapterName -match [regex]::Escape($profile.ExpectedNamePattern)) {
+                    $profile
+                    break
+                }
+            }
+        }
+    )
+    if ($matches.Count -ne 1) {
+        throw (
+            "Could not select exactly one supported GPU from: $($AdapterNames -join ', '). " +
+            'Use -GpuProfile gfx1201 or -GpuProfile gfx1032 to override automatic detection.'
+        )
+    }
+    return [string] $matches[0].Id
+}
+
 function Select-InvokeAIGpuDevice {
     param(
         [Parameter(Mandatory)]

@@ -4,8 +4,8 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('gfx1201', 'gfx1032')]
-    [string] $GpuProfile = 'gfx1201'
+    [ValidateSet('Auto', 'gfx1201', 'gfx1032')]
+    [string] $GpuProfile = 'Auto'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +40,15 @@ $RocmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\bin'
 $RocmLlvmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\lib\llvm\bin'
 
 . (Join-Path $ProjectRoot 'scripts\gpu-profiles.ps1')
+$RequestedGpuProfile = $GpuProfile
+if ($GpuProfile -eq 'Auto') {
+    $windowsAdapterNames = @(
+        Get-CimInstance Win32_VideoController -ErrorAction Stop |
+            ForEach-Object { [string] $_.Name } |
+            Where-Object { $_ }
+    )
+    $GpuProfile = Resolve-InvokeAIGpuProfileId -AdapterNames $windowsAdapterNames
+}
 $SelectedGpuProfile = Get-InvokeAIGpuProfile -Id $GpuProfile
 $ProfileVersions = @{
     invokeai = $InvokeAIVersion
@@ -83,6 +92,9 @@ function Set-Utf8NoBom {
 Write-Host 'InvokeAI 6.14 + ROCm 10 for Windows' -ForegroundColor Cyan
 Write-Host "Project: $ProjectRoot" -ForegroundColor DarkGray
 Write-Host "GPU profile: $($SelectedGpuProfile.DisplayName) ($GpuProfile, $($SelectedGpuProfile.VramGB) GB)" -ForegroundColor DarkGray
+if ($RequestedGpuProfile -eq 'Auto') {
+    Write-Host 'GPU profile was detected automatically by Windows.' -ForegroundColor DarkGray
+}
 
 $existingProfileManifest = Read-InvokeAIGpuProfileManifest `
     -EnvironmentPath $EnvironmentPath `

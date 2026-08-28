@@ -21,13 +21,16 @@ Clone or extract the project to a short path such as
 `D:\AI\invokeai-rocm-windows`, then run:
 
 ```powershell
-# RX 9070 XT
 .\setup.ps1
 .\run.ps1
+```
 
-# RX 6600 XT
+The setup script detects the RX 9070 XT or RX 6600 XT automatically. The
+profile can still be selected manually on unusual multi-GPU systems:
+
+```powershell
+.\setup.ps1 -GpuProfile gfx1201
 .\setup.ps1 -GpuProfile gfx1032
-.\run.ps1
 ```
 
 Open <http://localhost:9090>.
