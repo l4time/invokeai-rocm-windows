@@ -54,13 +54,13 @@ workflow uses its Simple noise schedule.
 The same Wai Illustrious SDXL generation used 1024×1024, 22 steps, DPM++ 3M
 Karras, CFG 7.5, and batch size 1.
 
-| First image after starting InvokeAI | Time |
-|---|---:|
-| InvokeAI 6.9 + ROCm 7.1 | 35.17 s |
-| InvokeAI 6.14 + ROCm 10 | 20.20 s |
+| Metric | InvokeAI 6.9 + ROCm 7.1 | InvokeAI 6.14 + ROCm 10 | Improvement |
+|---|---:|---:|---:|
+| First image after starting InvokeAI | 35.17 s | 20.20 s | 42.6% lower latency |
+| Sampler, model loaded | 4.53 it/s | 4.89 it/s | 7.9% faster |
 
-**ROCm 10 stack result: 14.97 seconds saved, 42.6% lower latency, and 1.74×
-the speed.**
+**The complete ROCm 10 stack is 1.74× faster on the first image. Raw denoising
+throughput is 1.08× faster.**
 
 This is the user-visible improvement from upgrading the complete repository.
 It includes the newer InvokeAI version, launcher, and settings as well as ROCm,
@@ -70,7 +70,7 @@ so it should not be read as a ROCm-only microbenchmark.
 
 | Model | Resolution / steps | Sampler | Model loaded | First image |
 |---|---:|---:|---:|---:|
-| Wai Illustrious SDXL | 1024² / 22 | — | 6.04 s median | 20.20 s |
+| Wai Illustrious SDXL | 1024² / 22 | 4.89 it/s | 6.04 s median | 20.20 s |
 | RedCraft Krea 2 INT4 | 1024² / 8 | 1.05 it/s | 8.73 s median | 41.21 s median |
 | Anima Turbo v1.1 | 1024² / 8 | 3.76 it/s | 3.02 s median | 14.64 s median |
 
