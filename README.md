@@ -32,6 +32,9 @@ It installs the `gfx1201` ROCm packages, compiles the ConvRot INT4 HIP kernels,
 applies a version-checked Krea 2 compatibility patch, and runs GPU tests. It is
 safe to rerun and does not delete models, images, or the InvokeAI database.
 
+This setup adds tested INT4 support for the RedCraft Krea 2 ConvRot model on the
+RX 9070 XT. Stock InvokeAI 6.14 does not support this model format.
+
 ## Optional tested models
 
 Each model installer starts InvokeAI if needed, downloads the complete tested
