@@ -11,10 +11,18 @@ $EnvironmentPath = Join-Path $ProjectRoot 'env'
 $PythonExe = Join-Path $EnvironmentPath 'python.exe'
 $InvokeAIWeb = Join-Path $EnvironmentPath 'Scripts\invokeai-web.exe'
 $CacheRoot = Join-Path $ProjectRoot '.cache'
+$SitePackagesPath = Join-Path $EnvironmentPath 'Lib\site-packages'
+$RocmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\bin'
+$RocmLlvmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\lib\llvm\bin'
+
+. (Join-Path $ProjectRoot 'scripts\gpu-profiles.ps1')
 
 if (-not (Test-Path -LiteralPath $PythonExe) -or -not (Test-Path -LiteralPath $InvokeAIWeb)) {
     throw 'The ROCm 10 environment is missing. Run .\setup.ps1 first.'
 }
+
+$InstalledGpuProfile = Get-InstalledInvokeAIGpuProfile -EnvironmentPath $EnvironmentPath
+$env:HIP_VISIBLE_DEVICES = [string] $InstalledGpuProfile.DeviceIndex
 
 $env:PIP_CACHE_DIR = Join-Path $CacheRoot 'pip'
 $env:HF_HOME = Join-Path $CacheRoot 'huggingface'
@@ -24,7 +32,10 @@ $env:INVOKEAI_ROOT = Join-Path $ProjectRoot 'invokeai-data'
 $env:MIOPEN_FIND_MODE = 'FAST'
 $env:MIOPEN_USER_DB_PATH = Join-Path $CacheRoot 'miopen\db'
 $env:MIOPEN_CACHE_DIR = Join-Path $CacheRoot 'miopen\cache'
-$env:PATH = "$EnvironmentPath;$(Join-Path $EnvironmentPath 'Scripts');$env:PATH"
+$env:PATH = (
+    "$EnvironmentPath;$(Join-Path $EnvironmentPath 'Scripts');" +
+    "$RocmBinPath;$RocmLlvmBinPath;$env:PATH"
+)
 
 foreach ($directory in @(
     $env:INVOKEAI_ROOT,
@@ -34,25 +45,65 @@ foreach ($directory in @(
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
 
-$runtimeProbe = @'
+foreach ($toolPath in @(
+    (Join-Path $RocmBinPath 'hipInfo.exe'),
+    (Join-Path $RocmLlvmBinPath 'amdgpu-arch.exe')
+)) {
+    if (-not (Test-Path -LiteralPath $toolPath)) {
+        throw "The ROCm device tools are incomplete; missing: $toolPath"
+    }
+}
+
+$detectedArchitectures = @(
+    & (Join-Path $RocmLlvmBinPath 'amdgpu-arch.exe') |
+        ForEach-Object { ([string] $_).Trim() } |
+        Where-Object { $_ }
+)
+if ($LASTEXITCODE -ne 0 -or $InstalledGpuProfile.Id -notin $detectedArchitectures) {
+    throw (
+        "Installed GPU profile '$($InstalledGpuProfile.Id)', but amdgpu-arch detected: " +
+        "$($detectedArchitectures -join ', ')"
+    )
+}
+
+$runtimeProbe = @"
 from importlib.metadata import version
+import bitsandbytes
+from bitsandbytes.cuda_specs import get_rocm_gpu_arch
 import torch
 
 assert version('InvokeAI') == '6.14.0'
+assert bitsandbytes.__version__ == '0.50.2'
 assert torch.__version__ == '2.13.0+rocm10.0.0'
 assert torch.cuda.is_available(), 'ROCm GPU is unavailable'
+assert get_rocm_gpu_arch() == '$($InstalledGpuProfile.Id)', get_rocm_gpu_arch()
+name = torch.cuda.get_device_name(0)
+assert '$($InstalledGpuProfile.ExpectedNamePattern)'.lower() in name.lower(), name
 print(
     'InvokeAI '
     + version('InvokeAI')
     + ' | PyTorch '
     + torch.__version__
     + ' | '
-    + torch.cuda.get_device_name(0)
+    + name
+    + ' | '
+    + get_rocm_gpu_arch()
 )
-'@
+"@
 $runtime = & $PythonExe -c $runtimeProbe
 if ($LASTEXITCODE -ne 0) {
     throw 'The ROCm 10 runtime preflight failed.'
+}
+
+if ($InstalledGpuProfile.SupportsKrea2ConvRot) {
+    $convRotRuntimeProbe = @'
+from comfy_kitchen.backends import hip
+assert hip.is_available() and hip.has_wmma()
+'@
+    & $PythonExe -c $convRotRuntimeProbe
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The native Krea 2 ConvRot runtime preflight failed.'
+    }
 }
 
 Write-Host "`n$runtime" -ForegroundColor Cyan

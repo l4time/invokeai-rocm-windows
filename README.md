@@ -1,7 +1,7 @@
 # InvokeAI + ROCm 10 for AMD GPUs on Windows
 
-Native Windows setup for InvokeAI on AMD RDNA 4. It uses AMD's official
-ROCm/TheRock packages and is configured for the Radeon RX 9070 XT (`gfx1201`).
+Native Windows setup using AMD's official ROCm/TheRock packages. It supports
+the Radeon RX 9070 XT (`gfx1201`, 16 GB) and RX 6600 XT (`gfx1032`, 8 GB).
 
 ## Versions
 
@@ -9,7 +9,7 @@ ROCm/TheRock packages and is configured for the Radeon RX 9070 XT (`gfx1201`).
 - PyTorch 2.13.0+rocm10.0.0
 - Torchvision 0.28.0+rocm10.0.0
 - ROCm/TheRock 10.0
-- Comfy Kitchen 0.2.31, native HIP build for `gfx1201`
+- Comfy Kitchen 0.2.31, native HIP build for `gfx1201` only
 - Python 3.12
 
 Python 3.12 is the tested, pinned runtime. InvokeAI 6.14 supports Python 3.11
@@ -21,19 +21,27 @@ Clone or extract the project to a short path such as
 `D:\AI\invokeai-rocm-windows`, then run:
 
 ```powershell
+# RX 9070 XT
 .\setup.ps1
+.\run.ps1
+
+# RX 6600 XT
+.\setup.ps1 -GpuProfile gfx1032
 .\run.ps1
 ```
 
 Open <http://localhost:9090>.
 
 The setup keeps Python, packages, caches, models, and outputs inside the project.
-It installs the `gfx1201` ROCm packages, compiles the ConvRot INT4 HIP kernels,
-applies a version-checked Krea 2 compatibility patch, and runs GPU tests. It is
-safe to rerun and does not delete models, images, or the InvokeAI database.
+It installs the ROCm package matching the selected GPU and prevents InvokeAI
+from replacing the AMD PyTorch build. If an AMD integrated GPU is also present,
+it selects the named Radeon card explicitly. It is safe to rerun and does not
+delete models, images, or the InvokeAI database.
 
 This setup adds tested INT4 support for the RedCraft Krea 2 ConvRot model on the
-RX 9070 XT. Stock InvokeAI 6.14 does not support this model format.
+RX 9070 XT. It is not enabled on the RX 6600 XT: that card is RDNA 2, uses a
+different kernel target, and has 8 GB VRAM. Stock InvokeAI 6.14 does not support
+this model format.
 
 ## Optional tested models
 
@@ -48,7 +56,8 @@ model set, and is safe to rerun:
 The Anima script applies Turbo v1.1 defaults: ER-SDE, CFG 1, 8 steps, and
 1024×1024. The Krea 2 script installs the RedCraft INT4 ConvRot checkpoint with
 its FP8 encoder and applies Euler, CFG 1, 8 steps, and 1024×1024; the Krea
-workflow uses its Simple noise schedule.
+workflow uses its Simple noise schedule. The Krea 2 installer requires the
+`gfx1201` RX 9070 XT profile and checks for 16 GB VRAM before downloading.
 
 ## Measured RX 9070 XT performance
 
@@ -92,6 +101,8 @@ seconds while one-time runtime caches were created.
 
 ## Recommended InvokeAI settings
 
+RX 9070 XT:
+
 ```yaml
 max_cache_ram_gb: 16
 force_tiled_decode: true
@@ -99,8 +110,11 @@ force_tiled_decode: true
 
 Leave `device_working_mem_gb` unset to use InvokeAI's 3 GB default. The old
 8 GB reservation reduced the usable model cache. For RedCraft, automatic RAM
-cache sizing caused repeated model reloads, while 16 GB kept the working set
-resident. Tiled decode was also faster than untiled decode.
+cache sizing caused repeated model reloads, while 16 GB of system-RAM cache kept
+the working set resident. Tiled decode was also faster than untiled decode.
+
+The RX 6600 XT profile keeps cache sizing automatic, leaves the 3 GB working
+memory default unchanged, and enables tiled decode for its 8 GB VRAM limit.
 
 ## Benchmarking
 
@@ -135,8 +149,9 @@ batch size match; cold-start time is reported separately.
 - AMD Radeon RX 9070 XT, 16 GB
 - AMD display driver 32.0.31019.2002
 
-Other RDNA 4 cards need the matching ROCm device package and HIP architecture
-in `setup.ps1`.
+The RX 6600 XT `gfx1032` ROCm 10 package set resolves successfully, but its
+physical-GPU generation test is pending confirmation from an RX 6600 XT owner.
+Other AMD cards are not covered by these profiles.
 
 ## Directory layout
 

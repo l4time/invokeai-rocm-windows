@@ -1,9 +1,12 @@
-# InvokeAI 6.14 + ROCm 10 setup for Windows and AMD RDNA 4 (gfx1201).
+# InvokeAI 6.14 + ROCm 10 setup for supported AMD GPUs on Windows.
 # The Python runtime, ROCm packages, caches, models, and outputs stay under
 # this project directory. Windows and the AMD display driver remain system-wide.
 
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('gfx1201', 'gfx1032')]
+    [string] $GpuProfile = 'gfx1201'
+)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -12,6 +15,7 @@ Set-StrictMode -Version Latest
 $InvokeAIVersion = '6.14.0'
 $TorchVersion = '2.13.0+rocm10.0.0'
 $TorchvisionVersion = '0.28.0+rocm10.0.0'
+$BitsAndBytesVersion = '0.50.2'
 $RocmSdkVersion = '10.0.0'
 $ComfyKitchenVersion = '0.2.31'
 $ComfyKitchenCommit = '7490d8787ebd8bff49a0f59d8a40875cf2c98c1d'
@@ -32,6 +36,18 @@ $ComfyKitchenSource = Join-Path $SourcesRoot 'comfy-kitchen'
 $ComfyKitchenSourceMarker = Join-Path $ComfyKitchenSource '.invokeai-rocm-source-commit'
 $PatchesRoot = Join-Path $ProjectRoot 'patches'
 $SitePackagesPath = Join-Path $EnvironmentPath 'Lib\site-packages'
+$RocmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\bin'
+$RocmLlvmBinPath = Join-Path $SitePackagesPath '_rocm_sdk_core\lib\llvm\bin'
+
+. (Join-Path $ProjectRoot 'scripts\gpu-profiles.ps1')
+$SelectedGpuProfile = Get-InvokeAIGpuProfile -Id $GpuProfile
+$ProfileVersions = @{
+    invokeai = $InvokeAIVersion
+    torch = $TorchVersion
+    torchvision = $TorchvisionVersion
+    bitsandbytes = $BitsAndBytesVersion
+    rocm = $RocmSdkVersion
+}
 
 function Invoke-Checked {
     param(
@@ -66,6 +82,20 @@ function Set-Utf8NoBom {
 
 Write-Host 'InvokeAI 6.14 + ROCm 10 for Windows' -ForegroundColor Cyan
 Write-Host "Project: $ProjectRoot" -ForegroundColor DarkGray
+Write-Host "GPU profile: $($SelectedGpuProfile.DisplayName) ($GpuProfile, $($SelectedGpuProfile.VramGB) GB)" -ForegroundColor DarkGray
+
+$existingProfileManifest = Read-InvokeAIGpuProfileManifest `
+    -EnvironmentPath $EnvironmentPath `
+    -AllowMissing
+if (
+    $null -ne $existingProfileManifest -and
+    [string] $existingProfileManifest.gpu_profile -ne $GpuProfile
+) {
+    throw (
+        "This environment contains the '$($existingProfileManifest.gpu_profile)' GPU profile. " +
+        "It cannot be changed in place to '$GpuProfile'. Rename the 'env' directory and rerun setup."
+    )
+}
 
 foreach ($directory in @(
     $DataRoot,
@@ -87,7 +117,10 @@ $env:TORCH_HOME = Join-Path $CacheRoot 'torch'
 $env:XDG_CACHE_HOME = $CacheRoot
 $env:CONDA_PKGS_DIRS = Join-Path $CacheRoot 'conda\pkgs'
 $env:INVOKEAI_ROOT = $DataRoot
-$env:PATH = "$EnvironmentPath;$EnvironmentPath\Scripts;$env:PATH"
+$env:PATH = (
+    "$EnvironmentPath;$EnvironmentPath\Scripts;" +
+    "$RocmBinPath;$RocmLlvmBinPath;$env:PATH"
+)
 
 Write-Step 'Preparing project-local Miniconda'
 if (-not (Test-Path -LiteralPath $CondaExe)) {
@@ -131,31 +164,112 @@ if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.12\.') {
 }
 Write-Host "Python: $pythonVersion" -ForegroundColor Cyan
 
+$installedDeviceProbe = @'
+from importlib.metadata import distributions
+import re
+
+architectures = set()
+for distribution in distributions():
+    name = (distribution.metadata.get("Name") or "").lower()
+    match = re.search(r"device-(gfx[0-9a-f]+)$", name)
+    if match:
+        architectures.add(match.group(1))
+print(",".join(sorted(architectures)))
+'@
+$installedDeviceProbePath = Join-Path $ManifestRoot 'installed-device-packages.py'
+$installedDeviceProbe | Set-Content -LiteralPath $installedDeviceProbePath -Encoding utf8
+$installedDeviceArchitectures = & $PythonExe $installedDeviceProbePath
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not inspect existing ROCm device packages.'
+}
+foreach ($installedArchitecture in @($installedDeviceArchitectures -split ',')) {
+    if ($installedArchitecture -and $installedArchitecture -ne $GpuProfile) {
+        throw (
+            "The environment contains ROCm packages for '$installedArchitecture', not '$GpuProfile'. " +
+            "Rename the 'env' directory and rerun setup; mixed GPU packages are not supported."
+        )
+    }
+}
+
+Write-InvokeAIGpuProfileManifest `
+    -EnvironmentPath $EnvironmentPath `
+    -Profile $SelectedGpuProfile `
+    -Status 'installing' `
+    -Versions $ProfileVersions
+
 Write-Step 'Updating Python packaging tools'
 Invoke-Checked $PythonExe @('-m', 'pip', 'install', '--quiet', '--upgrade', 'pip', 'setuptools', 'wheel')
 
-Write-Step 'Installing ROCm 10 PyTorch and gfx1201 device kernels'
+Write-Step "Installing ROCm 10 PyTorch and $GpuProfile device kernels"
 Invoke-Checked $PythonExe @(
     '-m', 'pip', 'install',
     '--quiet',
     '--index-url', $AmdIndexUrl,
-    "torch[device-gfx1201]==$TorchVersion",
-    "torchvision[device-gfx1201]==$TorchvisionVersion"
+    "torch[device-$GpuProfile]==$TorchVersion",
+    "torchvision[device-$GpuProfile]==$TorchvisionVersion"
 )
 
+Remove-Item Env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+$gpuInventoryProbe = @'
+import json
+import torch
+
+print(json.dumps([
+    {"index": index, "name": torch.cuda.get_device_name(index)}
+    for index in range(torch.cuda.device_count())
+]))
+'@
+$gpuInventoryProbePath = Join-Path $ManifestRoot 'gpu-inventory.py'
+$gpuInventoryProbe | Set-Content -LiteralPath $gpuInventoryProbePath -Encoding utf8
+$gpuInventoryJson = (& $PythonExe $gpuInventoryProbePath) -join ''
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not enumerate AMD GPUs through PyTorch.'
+}
+$gpuInventory = @($gpuInventoryJson | ConvertFrom-Json)
+$selectedGpuDevice = Select-InvokeAIGpuDevice `
+    -Profile $SelectedGpuProfile `
+    -Devices $gpuInventory
+$SelectedGpuDeviceIndex = [int] $selectedGpuDevice.index
+$env:HIP_VISIBLE_DEVICES = [string] $SelectedGpuDeviceIndex
+Write-Host (
+    "Selected GPU [$SelectedGpuDeviceIndex]: $($selectedGpuDevice.name)"
+) -ForegroundColor Cyan
+
 Write-Step 'Running the ROCm GPU preflight'
-$gpuProbe = @'
+foreach ($toolPath in @(
+    (Join-Path $RocmBinPath 'hipInfo.exe'),
+    (Join-Path $RocmLlvmBinPath 'amdgpu-arch.exe')
+)) {
+    if (-not (Test-Path -LiteralPath $toolPath)) {
+        throw "The ROCm device tools are incomplete; missing: $toolPath"
+    }
+}
+
+$detectedArchitectures = @(
+    & (Join-Path $RocmLlvmBinPath 'amdgpu-arch.exe') |
+        ForEach-Object { ([string] $_).Trim() } |
+        Where-Object { $_ }
+)
+if ($LASTEXITCODE -ne 0 -or $GpuProfile -notin $detectedArchitectures) {
+    throw (
+        "Selected GPU profile '$GpuProfile', but amdgpu-arch detected: " +
+        "$($detectedArchitectures -join ', ')"
+    )
+}
+
+$gpuProbe = @"
 import json
 import torch
 import torchvision
 
 expected_torch = "2.13.0+rocm10.0.0"
 expected_torchvision = "0.28.0+rocm10.0.0"
+expected_name = "$($SelectedGpuProfile.ExpectedNamePattern)"
 assert torch.__version__ == expected_torch, (torch.__version__, expected_torch)
 assert torchvision.__version__ == expected_torchvision, (torchvision.__version__, expected_torchvision)
 assert torch.cuda.is_available(), "ROCm GPU is not available through torch.cuda"
 name = torch.cuda.get_device_name(0)
-assert "9070 XT" in name, name
+assert expected_name.lower() in name.lower(), (name, expected_name)
 
 device = torch.device("cuda:0")
 layer = torch.nn.Conv2d(32, 32, 3, padding=1, bias=False).to(device=device, dtype=torch.float16)
@@ -172,19 +286,27 @@ print(json.dumps({
     "device_capability": list(torch.cuda.get_device_capability(0)),
     "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
 }, indent=2))
-'@
+"@
 $gpuProbePath = Join-Path $ManifestRoot 'gpu-preflight.py'
 $gpuProbe | Set-Content -LiteralPath $gpuProbePath -Encoding utf8
 Invoke-Checked $PythonExe @($gpuProbePath)
 
 Write-Step "Auditing InvokeAI $InvokeAIVersion dependency resolution"
 $pipReport = Join-Path $ManifestRoot 'invokeai-pip-dry-run.json'
+$constraintsPath = Join-Path $ManifestRoot 'rocm-constraints.txt'
+@(
+    "torch==$TorchVersion"
+    "torchvision==$TorchvisionVersion"
+    "bitsandbytes==$BitsAndBytesVersion"
+) | Set-Content -LiteralPath $constraintsPath -Encoding ascii
 Invoke-Checked $PythonExe @(
     '-m', 'pip', 'install',
     '--quiet',
     '--dry-run',
     '--report', $pipReport,
-    "InvokeAI==$InvokeAIVersion"
+    '--constraint', $constraintsPath,
+    "InvokeAI==$InvokeAIVersion",
+    "bitsandbytes==$BitsAndBytesVersion"
 )
 
 $report = Get-Content -LiteralPath $pipReport -Raw | ConvertFrom-Json
@@ -201,8 +323,19 @@ foreach ($plannedInstall in @($report.install)) {
 }
 
 Write-Step "Installing InvokeAI $InvokeAIVersion from PyPI"
-Invoke-Checked $PythonExe @('-m', 'pip', 'install', '--quiet', "InvokeAI==$InvokeAIVersion")
+Invoke-Checked $PythonExe @(
+    '-m', 'pip', 'install',
+    '--quiet',
+    '--constraint', $constraintsPath,
+    "InvokeAI==$InvokeAIVersion",
+    "bitsandbytes==$BitsAndBytesVersion"
+)
+Invoke-Checked $PythonExe @(
+    '-c',
+    "import bitsandbytes, torch; from bitsandbytes.cuda_specs import get_rocm_gpu_arch; assert bitsandbytes.__version__ == '$BitsAndBytesVersion'; assert get_rocm_gpu_arch() == '$GpuProfile', get_rocm_gpu_arch(); assert '$($SelectedGpuProfile.ExpectedNamePattern)'.lower() in torch.cuda.get_device_name(0).lower(); print('bitsandbytes', bitsandbytes.__version__, '| architecture', get_rocm_gpu_arch())"
+)
 
+if ($SelectedGpuProfile.SupportsKrea2ConvRot) {
 Write-Step 'Preparing native ConvRot INT4 kernels for gfx1201'
 Invoke-Checked $PythonExe @(
     '-m', 'pip', 'install',
@@ -312,36 +445,50 @@ Invoke-Checked $PythonExe @(
     (Join-Path $PatchesRoot 'patch_invokeai.py'),
     '--site-packages', $SitePackagesPath
 )
+}
+else {
+    Write-Host (
+        "Skipping Krea 2 ConvRot native kernels for $($SelectedGpuProfile.DisplayName). " +
+        'Standard InvokeAI models remain available.'
+    ) -ForegroundColor DarkGray
+}
 
-Write-Step 'Applying the measured RX 9070 XT memory and decode settings'
+Write-Step "Applying settings for $($SelectedGpuProfile.DisplayName)"
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
-    $invokeAIConfig = @'
+    $invokeAIConfig = @"
 # Internal metadata - do not edit:
 schema_version: 4.0.3
 
-# Measured on an RX 9070 XT with InvokeAI 6.14.0 and PyTorch/ROCm 10.
 # device_working_mem_gb is intentionally omitted to use the 3 GB default.
-max_cache_ram_gb: 16
 force_tiled_decode: true
-'@
+"@
+    if ($SelectedGpuProfile.Id -eq 'gfx1201') {
+        $invokeAIConfig = $invokeAIConfig.TrimEnd() + "`r`nmax_cache_ram_gb: 16`r`n"
+    }
     Set-Utf8NoBom -Path $ConfigPath -Value ($invokeAIConfig.TrimEnd() + "`r`n")
 }
 else {
+    $configBackupPath = "$ConfigPath.pre-rocm-profile.bak"
+    if (-not (Test-Path -LiteralPath $configBackupPath)) {
+        Copy-Item -LiteralPath $ConfigPath -Destination $configBackupPath
+    }
     $invokeAIConfig = Get-Content -LiteralPath $ConfigPath -Raw
     $invokeAIConfig = [regex]::Replace(
         $invokeAIConfig,
         '(?m)^\s*device_working_mem_gb\s*:.*(?:\r?\n)?',
         ''
     )
-    if ($invokeAIConfig -match '(?m)^\s*max_cache_ram_gb\s*:') {
-        $invokeAIConfig = [regex]::Replace(
-            $invokeAIConfig,
-            '(?m)^\s*max_cache_ram_gb\s*:.*$',
-            'max_cache_ram_gb: 16'
-        )
-    }
-    else {
-        $invokeAIConfig = $invokeAIConfig.TrimEnd() + "`r`n`r`nmax_cache_ram_gb: 16`r`n"
+    if ($SelectedGpuProfile.Id -eq 'gfx1201') {
+        if ($invokeAIConfig -match '(?m)^\s*max_cache_ram_gb\s*:') {
+            $invokeAIConfig = [regex]::Replace(
+                $invokeAIConfig,
+                '(?m)^\s*max_cache_ram_gb\s*:.*$',
+                'max_cache_ram_gb: 16'
+            )
+        }
+        else {
+            $invokeAIConfig = $invokeAIConfig.TrimEnd() + "`r`n`r`nmax_cache_ram_gb: 16`r`n"
+        }
     }
     if ($invokeAIConfig -match '(?m)^\s*force_tiled_decode\s*:') {
         $invokeAIConfig = [regex]::Replace(
@@ -360,8 +507,14 @@ Write-Step 'Verifying the complete environment'
 Invoke-Checked $PythonExe @('-m', 'pip', 'check')
 Invoke-Checked $PythonExe @(
     '-c',
-    "from importlib.metadata import version; import torch, torchvision; from comfy_kitchen.backends import hip; assert version('InvokeAI') == '$InvokeAIVersion'; assert version('comfy-kitchen') == '$ComfyKitchenVersion'; assert torch.__version__ == '$TorchVersion'; assert torchvision.__version__ == '$TorchvisionVersion'; assert hip.is_available() and hip.has_wmma(); print('InvokeAI', version('InvokeAI')); print('PyTorch', torch.__version__); print('Torchvision', torchvision.__version__); print('Comfy Kitchen', version('comfy-kitchen')); print('GPU', torch.cuda.get_device_name(0))"
+    "from importlib.metadata import version; import bitsandbytes, torch, torchvision; from bitsandbytes.cuda_specs import get_rocm_gpu_arch; assert version('InvokeAI') == '$InvokeAIVersion'; assert bitsandbytes.__version__ == '$BitsAndBytesVersion'; assert torch.__version__ == '$TorchVersion'; assert torchvision.__version__ == '$TorchvisionVersion'; assert get_rocm_gpu_arch() == '$GpuProfile'; assert '$($SelectedGpuProfile.ExpectedNamePattern)'.lower() in torch.cuda.get_device_name(0).lower(); print('InvokeAI', version('InvokeAI')); print('PyTorch', torch.__version__); print('Torchvision', torchvision.__version__); print('bitsandbytes', bitsandbytes.__version__); print('GPU', torch.cuda.get_device_name(0), '|', get_rocm_gpu_arch())"
 )
+if ($SelectedGpuProfile.SupportsKrea2ConvRot) {
+    Invoke-Checked $PythonExe @(
+        '-c',
+        "from importlib.metadata import version; from comfy_kitchen.backends import hip; assert version('comfy-kitchen') == '$ComfyKitchenVersion'; assert hip.is_available() and hip.has_wmma(); print('Comfy Kitchen', version('comfy-kitchen'), '| native ConvRot ready')"
+    )
+}
 
 & $PythonExe -m pip freeze |
     Set-Content -LiteralPath (Join-Path $ManifestRoot 'pip-freeze.txt') -Encoding utf8
@@ -369,6 +522,13 @@ Invoke-Checked $PythonExe @(
 if (-not (Test-Path -LiteralPath $InvokeAIWeb)) {
     throw "InvokeAI launcher was not installed at $InvokeAIWeb"
 }
+
+Write-InvokeAIGpuProfileManifest `
+    -EnvironmentPath $EnvironmentPath `
+    -Profile $SelectedGpuProfile `
+    -Status 'complete' `
+    -Versions $ProfileVersions `
+    -DeviceIndex $SelectedGpuDeviceIndex
 
 Write-Host "`nSetup complete." -ForegroundColor Green
 Write-Host "Run .\run.ps1 and open http://localhost:9090" -ForegroundColor Cyan

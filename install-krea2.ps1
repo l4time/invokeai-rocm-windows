@@ -9,6 +9,34 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ProjectRoot = $PSScriptRoot
+$EnvironmentPath = Join-Path $ProjectRoot 'env'
+$PythonExe = Join-Path $EnvironmentPath 'python.exe'
+$ManifestRoot = Join-Path $ProjectRoot 'install-manifests'
+. (Join-Path $ProjectRoot 'scripts\gpu-profiles.ps1')
+$InstalledGpuProfile = Get-InstalledInvokeAIGpuProfile -EnvironmentPath $EnvironmentPath
+Assert-InvokeAIGpuCapability `
+    -Profile $InstalledGpuProfile `
+    -Capability 'krea2-convrot-int4'
+$env:HIP_VISIBLE_DEVICES = [string] $InstalledGpuProfile.DeviceIndex
+
+$kreaHardwareProbe = @'
+import torch
+
+assert torch.cuda.is_available(), "ROCm GPU is unavailable"
+properties = torch.cuda.get_device_properties(0)
+assert "Radeon RX 9070 XT" in properties.name, properties.name
+assert properties.total_memory >= 15 * 1024**3, (
+    properties.name,
+    round(properties.total_memory / 1024**3, 2),
+)
+'@
+$kreaHardwareProbePath = Join-Path $ManifestRoot 'krea2-hardware-preflight.py'
+$kreaHardwareProbe | Set-Content -LiteralPath $kreaHardwareProbePath -Encoding utf8
+& $PythonExe $kreaHardwareProbePath
+if ($LASTEXITCODE -ne 0) {
+    throw 'Krea 2 ConvRot requires the tested RX 9070 XT gfx1201 profile with 16 GB VRAM.'
+}
+
 . (Join-Path $ProjectRoot 'scripts\model-installer.ps1')
 
 $models = @(
