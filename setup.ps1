@@ -1,226 +1,374 @@
-# InvokeAI + ROCm 7.1.1 Setup Script for RX 9070 XT
-# Run this script ONCE to set up the environment
-# Everything is installed locally - NOTHING on C: drive
+# InvokeAI 6.14 + ROCm 10 setup for Windows and AMD RDNA 4 (gfx1201).
+# The Python runtime, ROCm packages, caches, models, and outputs stay under
+# this project directory. Windows and the AMD display driver remain system-wide.
 
-# ===========================================
-# CONFIGURATION - Change these if needed
-# ===========================================
-$INVOKEAI_VERSION = "6.9.0"  # InvokeAI version to install
-# ===========================================
+[CmdletBinding()]
+param()
 
-$ErrorActionPreference = "Stop"
-$PROJECT_ROOT = $PSScriptRoot
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "InvokeAI + ROCm 7.1.1 Setup" -ForegroundColor Cyan
-Write-Host "Tested on AMD RX 9070 XT (RDNA4)" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Project folder: $PROJECT_ROOT" -ForegroundColor Gray
-Write-Host ""
+$InvokeAIVersion = '6.14.0'
+$TorchVersion = '2.13.0+rocm10.0.0'
+$TorchvisionVersion = '0.28.0+rocm10.0.0'
+$RocmSdkVersion = '10.0.0'
+$ComfyKitchenVersion = '0.2.31'
+$ComfyKitchenCommit = '7490d8787ebd8bff49a0f59d8a40875cf2c98c1d'
+$AmdIndexUrl = 'https://stable.repo.amd.com/rocm/whl-next/'
 
-# Paths
-$MINICONDA_PATH = "$PROJECT_ROOT\miniconda"
-$CONDA_EXE = "$MINICONDA_PATH\Scripts\conda.exe"
-$PYTHON_EXE = "$MINICONDA_PATH\envs\invokeai\python.exe"
-$PIP_EXE = "$MINICONDA_PATH\envs\invokeai\Scripts\pip.exe"
-$ENV_PATH = "$MINICONDA_PATH\envs\invokeai"
+$ProjectRoot = $PSScriptRoot
+$MinicondaPath = Join-Path $ProjectRoot 'miniconda'
+$CondaExe = Join-Path $MinicondaPath 'Scripts\conda.exe'
+$EnvironmentPath = Join-Path $ProjectRoot 'env'
+$PythonExe = Join-Path $EnvironmentPath 'python.exe'
+$InvokeAIWeb = Join-Path $EnvironmentPath 'Scripts\invokeai-web.exe'
+$DataRoot = Join-Path $ProjectRoot 'invokeai-data'
+$ConfigPath = Join-Path $DataRoot 'invokeai.yaml'
+$CacheRoot = Join-Path $ProjectRoot '.cache'
+$ManifestRoot = Join-Path $ProjectRoot 'install-manifests'
+$SourcesRoot = Join-Path $CacheRoot 'sources'
+$ComfyKitchenSource = Join-Path $SourcesRoot 'comfy-kitchen'
+$ComfyKitchenSourceMarker = Join-Path $ComfyKitchenSource '.invokeai-rocm-source-commit'
+$PatchesRoot = Join-Path $ProjectRoot 'patches'
+$SitePackagesPath = Join-Path $EnvironmentPath 'Lib\site-packages'
 
-# Set environment variables to keep everything local
-$env:PIP_CACHE_DIR = "$PROJECT_ROOT\.cache\pip"
-$env:HF_HOME = "$PROJECT_ROOT\.cache\huggingface"
-$env:TORCH_HOME = "$PROJECT_ROOT\.cache\torch"
-$env:XDG_CACHE_HOME = "$PROJECT_ROOT\.cache"
-$env:INVOKEAI_ROOT = "$PROJECT_ROOT\invokeai-data"
-$env:CONDA_PKGS_DIRS = "$PROJECT_ROOT\.cache\conda\pkgs"
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory)]
+        [string] $FilePath,
+        [Parameter()]
+        [string[]] $ArgumentList = @()
+    )
 
-# Create directories
-Write-Host "[1/10] Creating directories..." -ForegroundColor Green
-$dirs = @(
-    "$PROJECT_ROOT\.cache\pip",
-    "$PROJECT_ROOT\.cache\huggingface",
-    "$PROJECT_ROOT\.cache\torch",
-    "$PROJECT_ROOT\.cache\conda\pkgs",
-    "$PROJECT_ROOT\invokeai-data"
+    & $FilePath @ArgumentList
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($ArgumentList -join ' ')"
+    }
+}
+
+function Write-Step {
+    param([string] $Message)
+    Write-Host "`n==> $Message" -ForegroundColor Green
+}
+
+function Set-Utf8NoBom {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Path,
+        [Parameter(Mandatory)]
+        [string] $Value
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Value, $utf8NoBom)
+}
+
+Write-Host 'InvokeAI 6.14 + ROCm 10 for Windows' -ForegroundColor Cyan
+Write-Host "Project: $ProjectRoot" -ForegroundColor DarkGray
+
+foreach ($directory in @(
+    $DataRoot,
+    $ManifestRoot,
+    (Join-Path $CacheRoot 'pip'),
+    (Join-Path $CacheRoot 'huggingface'),
+    (Join-Path $CacheRoot 'torch'),
+    (Join-Path $CacheRoot 'conda\pkgs'),
+    $SourcesRoot,
+    (Join-Path $CacheRoot 'miopen\db'),
+    (Join-Path $CacheRoot 'miopen\cache')
+)) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+}
+
+$env:PIP_CACHE_DIR = Join-Path $CacheRoot 'pip'
+$env:HF_HOME = Join-Path $CacheRoot 'huggingface'
+$env:TORCH_HOME = Join-Path $CacheRoot 'torch'
+$env:XDG_CACHE_HOME = $CacheRoot
+$env:CONDA_PKGS_DIRS = Join-Path $CacheRoot 'conda\pkgs'
+$env:INVOKEAI_ROOT = $DataRoot
+$env:PATH = "$EnvironmentPath;$EnvironmentPath\Scripts;$env:PATH"
+
+Write-Step 'Preparing project-local Miniconda'
+if (-not (Test-Path -LiteralPath $CondaExe)) {
+    $installerPath = Join-Path $ProjectRoot 'Miniconda3-latest-Windows-x86_64.exe'
+    $installerUrl = 'https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe'
+
+    Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+    try {
+        $installer = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList @('/S', "/D=$MinicondaPath") `
+            -Wait `
+            -PassThru
+        if ($installer.ExitCode -ne 0) {
+            throw "Miniconda installer failed with exit code $($installer.ExitCode)"
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $installerPath) {
+            Remove-Item -LiteralPath $installerPath -Force
+        }
+    }
+}
+
+foreach ($channel in @(
+    'https://repo.anaconda.com/pkgs/main',
+    'https://repo.anaconda.com/pkgs/r',
+    'https://repo.anaconda.com/pkgs/msys2'
+)) {
+    & $CondaExe tos accept --override-channels --channel $channel 2>$null
+}
+
+Write-Step "Creating the short-path Python 3.12 environment at '$EnvironmentPath'"
+if (-not (Test-Path -LiteralPath $PythonExe)) {
+    Invoke-Checked $CondaExe @('create', '-p', $EnvironmentPath, 'python=3.12', '-y')
+}
+
+$pythonVersion = & $PythonExe --version
+if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.12\.') {
+    throw "Expected Python 3.12, found: $pythonVersion"
+}
+Write-Host "Python: $pythonVersion" -ForegroundColor Cyan
+
+Write-Step 'Updating Python packaging tools'
+Invoke-Checked $PythonExe @('-m', 'pip', 'install', '--quiet', '--upgrade', 'pip', 'setuptools', 'wheel')
+
+Write-Step 'Installing ROCm 10 PyTorch and gfx1201 device kernels'
+Invoke-Checked $PythonExe @(
+    '-m', 'pip', 'install',
+    '--quiet',
+    '--index-url', $AmdIndexUrl,
+    "torch[device-gfx1201]==$TorchVersion",
+    "torchvision[device-gfx1201]==$TorchvisionVersion"
 )
-foreach ($dir in $dirs) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-}
 
-# Download and install Miniconda locally
-Write-Host "[2/10] Setting up Miniconda locally..." -ForegroundColor Green
-if (-not (Test-Path $CONDA_EXE)) {
-    $minicondaInstaller = "$PROJECT_ROOT\Miniconda3-latest-Windows-x86_64.exe"
+Write-Step 'Running the ROCm GPU preflight'
+$gpuProbe = @'
+import json
+import torch
+import torchvision
 
-    if (-not (Test-Path $minicondaInstaller)) {
-        Write-Host "  Downloading Miniconda (this may take a few minutes)..." -ForegroundColor Yellow
-        $minicondaUrl = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
-        Invoke-WebRequest -Uri $minicondaUrl -OutFile $minicondaInstaller -UseBasicParsing
-    }
+expected_torch = "2.13.0+rocm10.0.0"
+expected_torchvision = "0.28.0+rocm10.0.0"
+assert torch.__version__ == expected_torch, (torch.__version__, expected_torch)
+assert torchvision.__version__ == expected_torchvision, (torchvision.__version__, expected_torchvision)
+assert torch.cuda.is_available(), "ROCm GPU is not available through torch.cuda"
+name = torch.cuda.get_device_name(0)
+assert "9070 XT" in name, name
 
-    Write-Host "  Installing Miniconda to project folder..." -ForegroundColor Yellow
-    Start-Process -FilePath $minicondaInstaller -ArgumentList "/S", "/D=$MINICONDA_PATH" -Wait
+device = torch.device("cuda:0")
+layer = torch.nn.Conv2d(32, 32, 3, padding=1, bias=False).to(device=device, dtype=torch.float16)
+value = torch.randn((2, 32, 128, 128), device=device, dtype=torch.float16)
+result = layer(value)
+torch.cuda.synchronize()
+assert bool(torch.isfinite(result).all().item())
 
-    # Clean up installer
-    Remove-Item $minicondaInstaller -Force
-    Write-Host "  Miniconda installed successfully" -ForegroundColor Green
-} else {
-    Write-Host "  Miniconda already installed" -ForegroundColor Yellow
-}
+print(json.dumps({
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "hip": torch.version.hip,
+    "device": name,
+    "device_capability": list(torch.cuda.get_device_capability(0)),
+    "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
+}, indent=2))
+'@
+$gpuProbePath = Join-Path $ManifestRoot 'gpu-preflight.py'
+$gpuProbe | Set-Content -LiteralPath $gpuProbePath -Encoding utf8
+Invoke-Checked $PythonExe @($gpuProbePath)
 
-# Accept conda TOS (required for Anaconda channels)
-Write-Host "[3/10] Accepting conda Terms of Service..." -ForegroundColor Green
-& $CONDA_EXE tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>$null
-& $CONDA_EXE tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>$null
-& $CONDA_EXE tos accept --override-channels --channel https://repo.anaconda.com/pkgs/msys2 2>$null
+Write-Step "Auditing InvokeAI $InvokeAIVersion dependency resolution"
+$pipReport = Join-Path $ManifestRoot 'invokeai-pip-dry-run.json'
+Invoke-Checked $PythonExe @(
+    '-m', 'pip', 'install',
+    '--quiet',
+    '--dry-run',
+    '--report', $pipReport,
+    "InvokeAI==$InvokeAIVersion"
+)
 
-# Create conda environment with Python 3.12
-Write-Host "[4/10] Creating Python 3.12 environment..." -ForegroundColor Green
-if (-not (Test-Path $ENV_PATH)) {
-    & $CONDA_EXE create -p $ENV_PATH python=3.12 -y
-    Write-Host "  Python 3.12 environment created" -ForegroundColor Green
-} else {
-    Write-Host "  Python environment already exists" -ForegroundColor Yellow
-}
-
-# Verify Python version
-$pythonVersion = & $PYTHON_EXE --version 2>&1
-Write-Host "  Python version: $pythonVersion" -ForegroundColor Cyan
-
-# Install ROCm SDK packages (required for PyTorch)
-Write-Host "[5/10] Installing ROCm 7.1.1 SDK packages (~3.5GB)..." -ForegroundColor Green
-Write-Host "  This will take several minutes..." -ForegroundColor Yellow
-
-$rocmCore = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/rocm_sdk_core-0.1.dev0-py3-none-win_amd64.whl"
-$rocmDevel = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/rocm_sdk_devel-0.1.dev0-py3-none-win_amd64.whl"
-$rocmLibs = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/rocm_sdk_libraries_custom-0.1.dev0-py3-none-win_amd64.whl"
-$rocmMeta = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/rocm-0.1.dev0.tar.gz"
-
-& $PIP_EXE install --no-cache-dir $rocmCore $rocmDevel $rocmLibs $rocmMeta
-
-# Install ROCm PyTorch wheels
-Write-Host "[6/10] Installing ROCm 7.1.1 PyTorch wheels (~725MB)..." -ForegroundColor Green
-
-$torchWheel = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/torch-2.9.0+rocmsdk20251116-cp312-cp312-win_amd64.whl"
-$torchaudioWheel = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/torchaudio-2.9.0+rocmsdk20251116-cp312-cp312-win_amd64.whl"
-$torchvisionWheel = "https://repo.radeon.com/rocm/windows/rocm-rel-7.1.1/torchvision-0.24.0+rocmsdk20251116-cp312-cp312-win_amd64.whl"
-
-& $PIP_EXE install --no-deps --cache-dir "$PROJECT_ROOT\.cache\pip" $torchWheel $torchaudioWheel $torchvisionWheel
-
-# Install PyTorch dependencies (without the rocm meta package conflict)
-Write-Host "[7/10] Installing PyTorch dependencies..." -ForegroundColor Green
-& $PIP_EXE install --cache-dir "$PROJECT_ROOT\.cache\pip" filelock typing-extensions sympy networkx jinja2 fsspec pillow "numpy<2.0"
-
-# Verify GPU detection
-Write-Host "[8/10] Verifying GPU detection..." -ForegroundColor Green
-$gpuCheck = & $PYTHON_EXE -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO_GPU')" 2>&1
-
-if ($gpuCheck -eq "NO_GPU" -or $gpuCheck -match "error") {
-    Write-Host ""
-    Write-Host "  WARNING: No AMD GPU detected!" -ForegroundColor Red
-    Write-Host "  Make sure you have:" -ForegroundColor Yellow
-    Write-Host "    1. AMD Driver 25.20.0.17 or newer installed" -ForegroundColor Yellow
-    Write-Host "    2. ROCm components enabled in the driver" -ForegroundColor Yellow
-    Write-Host "    3. AMD GPU properly installed" -ForegroundColor Yellow
-    Write-Host ""
-} else {
-    Write-Host "  GPU detected: $gpuCheck" -ForegroundColor Cyan
-}
-
-# Install InvokeAI
-Write-Host "[9/10] Installing InvokeAI..." -ForegroundColor Green
-Write-Host "  This may take several minutes..." -ForegroundColor Yellow
-& $PIP_EXE install --cache-dir "$PROJECT_ROOT\.cache\pip" "invokeai==$INVOKEAI_VERSION"
-
-# Reinstall ROCm PyTorch (InvokeAI may have overwritten it)
-Write-Host "  Ensuring ROCm PyTorch is active..." -ForegroundColor Yellow
-& $PIP_EXE uninstall torch -y 2>$null
-& $PIP_EXE install --no-deps --cache-dir "$PROJECT_ROOT\.cache\pip" $torchWheel
-
-# Apply VAE speed fix for AMD ROCm
-Write-Host "[10/10] Applying AMD ROCm VAE speed patch..." -ForegroundColor Green
-$latentsToImagePath = "$ENV_PATH\Lib\site-packages\invokeai\app\invocations\latents_to_image.py"
-
-if (Test-Path $latentsToImagePath) {
-    $content = Get-Content $latentsToImagePath -Raw
-    $patched = $false
-
-    # Check if already patched
-    if ($content -match "PATCHED.*AMD ROCm") {
-        Write-Host "  VAE patch already applied" -ForegroundColor Yellow
-    } else {
-        # Patch 1: Change tile_size default from 0 to 512
-        if ($content -match 'tile_size: int = InputField\(default=0,') {
-            $content = $content -replace 'tile_size: int = InputField\(default=0,', 'tile_size: int = InputField(default=512,'
-            $patched = $true
+$report = Get-Content -LiteralPath $pipReport -Raw | ConvertFrom-Json
+foreach ($plannedInstall in @($report.install)) {
+    $packageName = [string] $plannedInstall.metadata.name
+    if ($packageName -in @('torch', 'torchvision')) {
+        $plannedVersion = [string] $plannedInstall.metadata.version
+        $plannedUrl = [string] $plannedInstall.download_info.url
+        $expectedVersion = if ($packageName -eq 'torch') { $TorchVersion } else { $TorchvisionVersion }
+        if ($plannedVersion -ne $expectedVersion -or $plannedUrl -notlike "$AmdIndexUrl*") {
+            throw "InvokeAI would replace AMD $packageName with $plannedVersion from $plannedUrl"
         }
+    }
+}
 
-        # Patch 2: Add cuDNN disable before VAE decode
-        # Find the line "# clear memory as vae decode can request a lot" and add patch after TorchDevice.empty_cache()
-        $searchPattern = "# clear memory as vae decode can request a lot`r?`n\s+TorchDevice\.empty_cache\(\)`r?`n`r?`n\s+with torch\.inference_mode"
-        $replacementBlock = @"
-# clear memory as vae decode can request a lot
-            TorchDevice.empty_cache()
+Write-Step "Installing InvokeAI $InvokeAIVersion from PyPI"
+Invoke-Checked $PythonExe @('-m', 'pip', 'install', '--quiet', "InvokeAI==$InvokeAIVersion")
 
-            # PATCHED: Disable cudnn/MIOpen for VAE decode on AMD ROCm (fixes extreme slowness)
-            # See: https://github.com/comfyanonymous/ComfyUI/pull/10302
-            # NOTE: We do NOT restore cudnn - leaving it disabled prevents MIOpen from
-            # accumulating slow kernels during the session
-            torch.backends.cudnn.enabled = False
-            torch.backends.cudnn.benchmark = False
+Write-Step 'Preparing native ConvRot INT4 kernels for gfx1201'
+Invoke-Checked $PythonExe @(
+    '-m', 'pip', 'install',
+    '--quiet',
+    '--index-url', $AmdIndexUrl,
+    "rocm-sdk-devel==$RocmSdkVersion"
+)
+Invoke-Checked $PythonExe @('-m', 'rocm_sdk', 'init')
+Invoke-Checked $PythonExe @(
+    '-m', 'pip', 'install',
+    '--quiet',
+    'cmake==4.4.2',
+    'ninja==1.13.0',
+    'nanobind==3.0.0'
+)
 
-            with torch.inference_mode
+$comfyKitchenProbe = @"
+from importlib.metadata import version
+from comfy_kitchen.backends import hip
+assert version("comfy-kitchen") == "$ComfyKitchenVersion"
+assert hip.is_available()
+assert hip.has_wmma()
 "@
-        if ($content -match $searchPattern) {
-            $content = $content -replace $searchPattern, $replacementBlock
-            $patched = $true
-        }
+$comfyKitchenProbePath = Join-Path $ManifestRoot 'comfy-kitchen-readiness.py'
+$comfyKitchenProbe | Set-Content -LiteralPath $comfyKitchenProbePath -Encoding utf8
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+& $PythonExe $comfyKitchenProbePath *> $null
+$comfyKitchenReady = $LASTEXITCODE -eq 0
+$ErrorActionPreference = $previousErrorActionPreference
 
-        if ($patched) {
-            Set-Content -Path $latentsToImagePath -Value $content -NoNewline
-            Write-Host "  VAE patch applied successfully" -ForegroundColor Green
-            Write-Host "  - tile_size default: 0 -> 512" -ForegroundColor Gray
-            Write-Host "  - cuDNN/MIOpen disabled during VAE decode" -ForegroundColor Gray
-        } else {
-            Write-Host "  WARNING: Could not apply patch (file structure may have changed)" -ForegroundColor Red
-            Write-Host "  You may need to manually patch latents_to_image.py" -ForegroundColor Yellow
-        }
+if (-not $comfyKitchenReady) {
+    $cachedSourceCommit = if (Test-Path -LiteralPath $ComfyKitchenSourceMarker) {
+        (Get-Content -LiteralPath $ComfyKitchenSourceMarker -Raw).Trim()
     }
-} else {
-    Write-Host "  WARNING: latents_to_image.py not found!" -ForegroundColor Red
-    Write-Host "  Path: $latentsToImagePath" -ForegroundColor Gray
+    else {
+        ''
+    }
+    if (
+        -not (Test-Path -LiteralPath (Join-Path $ComfyKitchenSource 'setup.py')) -or
+        $cachedSourceCommit -ne $ComfyKitchenCommit
+    ) {
+        $sourceArchive = Join-Path $SourcesRoot "comfy-kitchen-$ComfyKitchenCommit.zip"
+        $expandedSource = Join-Path $SourcesRoot "comfy-kitchen-$ComfyKitchenCommit"
+        if (Test-Path -LiteralPath $ComfyKitchenSource) {
+            Remove-Item -LiteralPath $ComfyKitchenSource -Recurse -Force
+        }
+        if (-not (Test-Path -LiteralPath $sourceArchive)) {
+            Invoke-WebRequest `
+                -Uri "https://github.com/Comfy-Org/comfy-kitchen/archive/$ComfyKitchenCommit.zip" `
+                -OutFile $sourceArchive `
+                -UseBasicParsing
+        }
+        if (Test-Path -LiteralPath $expandedSource) {
+            Remove-Item -LiteralPath $expandedSource -Recurse -Force
+        }
+        Expand-Archive -LiteralPath $sourceArchive -DestinationPath $SourcesRoot -Force
+        Move-Item -LiteralPath $expandedSource -Destination $ComfyKitchenSource
+        $ComfyKitchenCommit |
+            Set-Content -LiteralPath $ComfyKitchenSourceMarker -Encoding ascii
+    }
+
+    Invoke-Checked $PythonExe @(
+        (Join-Path $PatchesRoot 'patch_comfy_kitchen.py'),
+        '--source', $ComfyKitchenSource,
+        '--site-packages', $SitePackagesPath
+    )
+
+    $env:COMFY_KITCHEN_BUILD_HIP = '1'
+    $env:COMFY_HIP_ARCHS = 'gfx1201'
+    Invoke-Checked $PythonExe @(
+        '-m', 'pip', 'install',
+        '--quiet',
+        '--force-reinstall',
+        '--no-build-isolation',
+        '--no-deps',
+        $ComfyKitchenSource
+    )
+}
+else {
+    Write-Host 'Native comfy-kitchen gfx1201 backend already works; rebuild skipped.' -ForegroundColor DarkGray
 }
 
-# Final verification
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "Verifying Installation..." -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
+$convRotProbe = @'
+import torch
+import torch.nn.functional as functional
+from comfy_kitchen.backends import hip
+from comfy_kitchen.tensor import QuantizedTensor
 
-$torchVer = & $PYTHON_EXE -c "import torch; print(torch.__version__)" 2>$null
-$gpuName = & $PYTHON_EXE -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')" 2>$null
-$invokeCheck = & $PIP_EXE show invokeai 2>$null | Select-String "Version"
+assert hip.is_available(), "comfy-kitchen HIP backend is unavailable"
+assert hip.has_wmma(), "gfx1201 matrix cores were not detected"
+x = torch.randn((64, 256), device="cuda", dtype=torch.bfloat16)
+w = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+packed = QuantizedTensor.from_float(w, "TensorCoreConvRotW4A4Layout")
+result = functional.linear(x, packed)
+torch.cuda.synchronize()
+assert result.shape == (64, 128)
+assert bool(torch.isfinite(result).all().item())
+print("Native ConvRot INT4 gfx1201 kernel: OK")
+'@
+$convRotProbePath = Join-Path $ManifestRoot 'convrot-preflight.py'
+$convRotProbe | Set-Content -LiteralPath $convRotProbePath -Encoding utf8
+Invoke-Checked $PythonExe @($convRotProbePath)
 
-Write-Host "  PyTorch: $torchVer" -ForegroundColor Cyan
-Write-Host "  GPU: $gpuName" -ForegroundColor Cyan
-Write-Host "  InvokeAI: $invokeCheck" -ForegroundColor Cyan
+Write-Step 'Applying the InvokeAI 6.14 Krea 2 INT4 compatibility patch'
+Invoke-Checked $PythonExe @(
+    (Join-Path $PatchesRoot 'patch_invokeai.py'),
+    '--site-packages', $SitePackagesPath
+)
 
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Green
-Write-Host "Setup Complete!" -ForegroundColor Green
-Write-Host "========================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "Directory structure:" -ForegroundColor Cyan
-Write-Host "  $PROJECT_ROOT" -ForegroundColor White
-Write-Host "  +-- miniconda\        (Python environment)" -ForegroundColor Gray
-Write-Host "  +-- .cache\           (pip, huggingface, torch caches)" -ForegroundColor Gray
-Write-Host "  +-- invokeai-data\    (models, outputs, configs)" -ForegroundColor Gray
-Write-Host "  +-- run.ps1           (launch script)" -ForegroundColor Gray
-Write-Host ""
-Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  1. Run: .\run.ps1" -ForegroundColor White
-Write-Host "  2. Open: http://localhost:9090" -ForegroundColor White
-Write-Host ""
-Write-Host "First run will prompt you to download models." -ForegroundColor Yellow
+Write-Step 'Applying the measured RX 9070 XT memory and decode settings'
+if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    $invokeAIConfig = @'
+# Internal metadata - do not edit:
+schema_version: 4.0.3
+
+# Measured on an RX 9070 XT with InvokeAI 6.14.0 and PyTorch/ROCm 10.
+# device_working_mem_gb is intentionally omitted to use the 3 GB default.
+max_cache_ram_gb: 16
+force_tiled_decode: true
+'@
+    Set-Utf8NoBom -Path $ConfigPath -Value ($invokeAIConfig.TrimEnd() + "`r`n")
+}
+else {
+    $invokeAIConfig = Get-Content -LiteralPath $ConfigPath -Raw
+    $invokeAIConfig = [regex]::Replace(
+        $invokeAIConfig,
+        '(?m)^\s*device_working_mem_gb\s*:.*(?:\r?\n)?',
+        ''
+    )
+    if ($invokeAIConfig -match '(?m)^\s*max_cache_ram_gb\s*:') {
+        $invokeAIConfig = [regex]::Replace(
+            $invokeAIConfig,
+            '(?m)^\s*max_cache_ram_gb\s*:.*$',
+            'max_cache_ram_gb: 16'
+        )
+    }
+    else {
+        $invokeAIConfig = $invokeAIConfig.TrimEnd() + "`r`n`r`nmax_cache_ram_gb: 16`r`n"
+    }
+    if ($invokeAIConfig -match '(?m)^\s*force_tiled_decode\s*:') {
+        $invokeAIConfig = [regex]::Replace(
+            $invokeAIConfig,
+            '(?m)^\s*force_tiled_decode\s*:.*$',
+            'force_tiled_decode: true'
+        )
+    }
+    else {
+        $invokeAIConfig = $invokeAIConfig.TrimEnd() + "`r`nforce_tiled_decode: true`r`n"
+    }
+    Set-Utf8NoBom -Path $ConfigPath -Value ($invokeAIConfig.TrimEnd() + "`r`n")
+}
+
+Write-Step 'Verifying the complete environment'
+Invoke-Checked $PythonExe @('-m', 'pip', 'check')
+Invoke-Checked $PythonExe @(
+    '-c',
+    "from importlib.metadata import version; import torch, torchvision; from comfy_kitchen.backends import hip; assert version('InvokeAI') == '$InvokeAIVersion'; assert version('comfy-kitchen') == '$ComfyKitchenVersion'; assert torch.__version__ == '$TorchVersion'; assert torchvision.__version__ == '$TorchvisionVersion'; assert hip.is_available() and hip.has_wmma(); print('InvokeAI', version('InvokeAI')); print('PyTorch', torch.__version__); print('Torchvision', torchvision.__version__); print('Comfy Kitchen', version('comfy-kitchen')); print('GPU', torch.cuda.get_device_name(0))"
+)
+
+& $PythonExe -m pip freeze |
+    Set-Content -LiteralPath (Join-Path $ManifestRoot 'pip-freeze.txt') -Encoding utf8
+
+if (-not (Test-Path -LiteralPath $InvokeAIWeb)) {
+    throw "InvokeAI launcher was not installed at $InvokeAIWeb"
+}
+
+Write-Host "`nSetup complete." -ForegroundColor Green
+Write-Host "Run .\run.ps1 and open http://localhost:9090" -ForegroundColor Cyan

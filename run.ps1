@@ -1,96 +1,73 @@
-# InvokeAI + ROCm 7.1.1 Launch Script
-# Run this script to start InvokeAI
+# Launch InvokeAI 6.14 with ROCm 10 on Windows.
 
-$ErrorActionPreference = "SilentlyContinue"
-$PROJECT_ROOT = $PSScriptRoot
+[CmdletBinding()]
+param()
 
-Write-Host ""
-Write-Host "  InvokeAI + ROCm 7.1.1" -ForegroundColor Cyan
-Write-Host "  =====================" -ForegroundColor Cyan
-Write-Host ""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 
-# Paths
-$MINICONDA_PATH = "$PROJECT_ROOT\miniconda"
-$PYTHON_EXE = "$MINICONDA_PATH\envs\invokeai\python.exe"
-$INVOKEAI_WEB = "$MINICONDA_PATH\envs\invokeai\Scripts\invokeai-web.exe"
+$ProjectRoot = $PSScriptRoot
+$EnvironmentPath = Join-Path $ProjectRoot 'env'
+$PythonExe = Join-Path $EnvironmentPath 'python.exe'
+$InvokeAIWeb = Join-Path $EnvironmentPath 'Scripts\invokeai-web.exe'
+$CacheRoot = Join-Path $ProjectRoot '.cache'
 
-# Check if environment exists
-if (-not (Test-Path $PYTHON_EXE)) {
-    Write-Host "  ERROR: Python environment not found!" -ForegroundColor Red
-    Write-Host "  Please run setup.ps1 first." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "Press any key to exit..."
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-    exit 1
+if (-not (Test-Path -LiteralPath $PythonExe) -or -not (Test-Path -LiteralPath $InvokeAIWeb)) {
+    throw 'The ROCm 10 environment is missing. Run .\setup.ps1 first.'
 }
 
-# Set environment variables to keep everything local
-$env:PIP_CACHE_DIR = "$PROJECT_ROOT\.cache\pip"
-$env:HF_HOME = "$PROJECT_ROOT\.cache\huggingface"
-$env:TORCH_HOME = "$PROJECT_ROOT\.cache\torch"
-$env:XDG_CACHE_HOME = "$PROJECT_ROOT\.cache"
-$env:INVOKEAI_ROOT = "$PROJECT_ROOT\invokeai-data"
+$env:PIP_CACHE_DIR = Join-Path $CacheRoot 'pip'
+$env:HF_HOME = Join-Path $CacheRoot 'huggingface'
+$env:TORCH_HOME = Join-Path $CacheRoot 'torch'
+$env:XDG_CACHE_HOME = $CacheRoot
+$env:INVOKEAI_ROOT = Join-Path $ProjectRoot 'invokeai-data'
+$env:MIOPEN_FIND_MODE = 'FAST'
+$env:MIOPEN_USER_DB_PATH = Join-Path $CacheRoot 'miopen\db'
+$env:MIOPEN_CACHE_DIR = Join-Path $CacheRoot 'miopen\cache'
+$env:PATH = "$EnvironmentPath;$(Join-Path $EnvironmentPath 'Scripts');$env:PATH"
 
-# Fix for ROCm 7 VAE speed issues - MIOpen has performance bugs
-$env:MIOPEN_FIND_MODE = "FAST"
-
-# Suppress Python deprecation warnings (noisy third-party libs)
-$env:PYTHONWARNINGS = "ignore::DeprecationWarning"
-
-# Suppress bitsandbytes ROCm warnings (not needed for basic generation)
-$env:BITSANDBYTES_NOWELCOME = "1"
-$env:BNB_CUDA_VERSION = ""
-
-# Set MIOpen cache to local folder and clear it on start
-$env:MIOPEN_USER_DB_PATH = "$PROJECT_ROOT\.cache\miopen\db"
-$env:MIOPEN_CACHE_DIR = "$PROJECT_ROOT\.cache\miopen\cache"
-if (Test-Path "$PROJECT_ROOT\.cache\miopen") {
-    Remove-Item -Recurse -Force "$PROJECT_ROOT\.cache\miopen" -ErrorAction SilentlyContinue
+foreach ($directory in @(
+    $env:INVOKEAI_ROOT,
+    $env:MIOPEN_USER_DB_PATH,
+    $env:MIOPEN_CACHE_DIR
+)) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
-New-Item -ItemType Directory -Path "$PROJECT_ROOT\.cache\miopen\db" -Force | Out-Null
-New-Item -ItemType Directory -Path "$PROJECT_ROOT\.cache\miopen\cache" -Force | Out-Null
 
-# Clear InvokeAI Python cache (ensures patches are always loaded)
-$cachePaths = @(
-    "$PROJECT_ROOT\miniconda\envs\invokeai\Lib\site-packages\invokeai\app\invocations\__pycache__",
-    "$PROJECT_ROOT\miniconda\envs\invokeai\Lib\site-packages\invokeai\app\util\__pycache__"
+$runtimeProbe = @'
+from importlib.metadata import version
+import torch
+
+assert version('InvokeAI') == '6.14.0'
+assert torch.__version__ == '2.13.0+rocm10.0.0'
+assert torch.cuda.is_available(), 'ROCm GPU is unavailable'
+print(
+    'InvokeAI '
+    + version('InvokeAI')
+    + ' | PyTorch '
+    + torch.__version__
+    + ' | '
+    + torch.cuda.get_device_name(0)
 )
-foreach ($cachePath in $cachePaths) {
-    if (Test-Path $cachePath) {
-        Remove-Item -Recurse -Force $cachePath -ErrorAction SilentlyContinue
-    }
+'@
+$runtime = & $PythonExe -c $runtimeProbe
+if ($LASTEXITCODE -ne 0) {
+    throw 'The ROCm 10 runtime preflight failed.'
 }
 
-# Check GPU (suppress warnings)
-Write-Host "  Checking GPU..." -ForegroundColor Gray
-$gpuCheck = & $PYTHON_EXE -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')" 2>$null
-if ($gpuCheck) {
-    # Clean up the output (remove warning lines)
-    $gpuName = ($gpuCheck -split "`n" | Where-Object { $_ -notmatch "Warning|warning|ERROR" } | Select-Object -Last 1).Trim()
-    if ($gpuName) {
-        Write-Host "  GPU: $gpuName" -ForegroundColor Green
-    } else {
-        Write-Host "  GPU: Detected (name unavailable)" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "  GPU: Not detected" -ForegroundColor Yellow
-}
-Write-Host ""
+Write-Host "`n$runtime" -ForegroundColor Cyan
+Write-Host 'http://localhost:9090' -ForegroundColor Cyan
+Write-Host 'Press Ctrl+C to stop.' -ForegroundColor DarkGray
 
-# Launch InvokeAI
-Write-Host "  Starting web interface..." -ForegroundColor Gray
-Write-Host ""
-Write-Host "  URL: http://localhost:9090" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  Press Ctrl+C to stop" -ForegroundColor DarkGray
-Write-Host ""
-
-# Run InvokeAI (output to console and log file)
-& $INVOKEAI_WEB 2>&1 | Tee-Object -FilePath "$PROJECT_ROOT\invokeai.log"
-
-# After exit
-Write-Host ""
-Write-Host "  InvokeAI stopped. Log saved to invokeai.log" -ForegroundColor Gray
-Write-Host ""
-Write-Host "Press any key to exit..."
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+$ErrorActionPreference = 'Continue'
+& $InvokeAIWeb 2>&1 |
+    ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.Exception.Message
+        }
+        else {
+            $_
+        }
+    } |
+    Tee-Object -FilePath (Join-Path $ProjectRoot 'invokeai.log')
+exit $LASTEXITCODE

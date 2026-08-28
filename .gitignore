@@ -5,9 +5,17 @@
 
 # InvokeAI data (models, outputs, database)
 invokeai-data/
+invokeai-data-*/
 
 # Miniconda environment
 miniconda/
+env/
+
+# Generated setup and benchmark artifacts
+install-manifests/
+benchmarks/
+__pycache__/
+*.py[cod]
 
 # Log files
 *.log
